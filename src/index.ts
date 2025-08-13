@@ -6,7 +6,7 @@ import {
   stringToUuid,
   type Character,
 } from "@elizaos/core";
-import { bootstrapPlugin } from "@elizaos/plugin-bootstrap";
+// import { bootstrapPlugin } from "@elizaos/plugin-bootstrap";
 import { createNodePlugin } from "@elizaos/plugin-node";
 import { solanaPlugin } from "@elizaos/plugin-solana";
 import fs from "fs";
@@ -23,10 +23,9 @@ import {
   parseArguments,
 } from "./config/index.ts";
 import { initializeDatabase } from "./database/index.ts";
+// ❌ removed: import { DiscoveryRoutes } from "./discoveryRoutes.ts";
 
 import { grandVillaDiscoveryAction } from "./actions/grand-villa-discovery.ts";
-// import { newsAction } from "./actions/news-actions.ts";
-// import { grandvillaAction } from "./actions/grand-villa.ts";
 import { discoveryStateProvider } from "./providers/discovery-state.ts";
 import { AuthServer } from "./server/auth-server.ts";
 
@@ -62,13 +61,11 @@ export function createAgent(
     evaluators: [],
     character,
     plugins: [
-      // Remove or comment out plugins that might have competing actions
-      // bootstrapPlugin,  // <-- Comment this out temporarily
+      // bootstrapPlugin, // keep commented if it conflicts with custom actions
       nodePlugin,
       character.settings?.secrets?.WALLET_PUBLIC_KEY ? solanaPlugin : null,
     ].filter(Boolean),
     providers: [discoveryStateProvider],
-    // ONLY register YOUR action - no other actions
     actions: [grandVillaDiscoveryAction],
     services: [],
     managers: [],
@@ -89,21 +86,17 @@ async function startAgent(character: Character, directClient: DirectClient) {
     }
 
     const db = initializeDatabase(dataDir);
-
     await db.init();
 
     const cache = initializeDbCache(character, db);
     const runtime = createAgent(character, db, cache, token);
 
     await runtime.initialize();
-
     runtime.clients = await initializeClients(character, runtime);
 
     directClient.registerAgent(runtime);
 
-    // report to console
     elizaLogger.debug(`Started ${character.name} as ${runtime.agentId}`);
-
     return runtime;
   } catch (error) {
     elizaLogger.error(
@@ -120,9 +113,7 @@ const checkPortAvailable = (port: number): Promise<boolean> => {
     const server = net.createServer();
 
     server.once("error", (err: NodeJS.ErrnoException) => {
-      if (err.code === "EADDRINUSE") {
-        resolve(false);
-      }
+      if (err.code === "EADDRINUSE") resolve(false);
     });
 
     server.once("listening", () => {
@@ -147,9 +138,9 @@ const startAgents = async () => {
     characters = await loadCharacters(charactersArg);
   }
   console.log("characters", characters);
-  
+
   let firstRuntime: any = null;
-  
+
   try {
     for (const character of characters) {
       const runtime = await startAgent(character, directClient as DirectClient);
@@ -166,29 +157,30 @@ const startAgents = async () => {
     serverPort++;
   }
 
-  // upload some agent functionality into directClient
-  directClient.startAgent = async (character: Character) => {
-    // wrap it so we don't have to inject directClient later
-    return startAgent(character, directClient);
+  // Expose startAgent on directClient
+  (directClient as any).startAgent = async (c: Character) => {
+    return startAgent(c, directClient);
   };
 
-  // Start DirectClient on an internal port (serverPort + 1000 to avoid conflicts)
-  const directClientPort = serverPort + 1000;
+  // Start DirectClient on an internal port (serverPort + 1000, move if taken)
+  let directClientPort = serverPort + 1000;
   while (!(await checkPortAvailable(directClientPort))) {
-    elizaLogger.warn(`Internal port ${directClientPort} is in use, trying ${directClientPort + 1}`);
+    elizaLogger.warn(
+      `Internal port ${directClientPort} is in use, trying ${directClientPort + 1}`
+    );
+    directClientPort++;
   }
   directClient.start(directClientPort);
   elizaLogger.info(`DirectClient started on internal port ${directClientPort}`);
 
-  // Create integrated server with auth and message proxying
   if (firstRuntime) {
     const authServer = new AuthServer(firstRuntime);
-    const { createServer, request } = await import('http');
-    
-    // Helper function to proxy requests
+    const { createServer, request } = await import("http");
+
+    // Proxy any unmatched requests to the DirectClient
     const proxyRequest = (req: any, res: any) => {
       const options = {
-        hostname: 'localhost',
+        hostname: "localhost",
         port: directClientPort,
         path: req.url,
         method: req.method,
@@ -200,42 +192,54 @@ const startAgents = async () => {
         proxyRes.pipe(res, { end: true });
       });
 
-      proxyReq.on('error', (error) => {
-        elizaLogger.error('Proxy error:', error);
+      proxyReq.on("error", (error) => {
+        elizaLogger.error("Proxy error:", error);
         res.statusCode = 500;
-        res.end('Internal Server Error');
+        res.end("Internal Server Error");
       });
 
       req.pipe(proxyReq, { end: true });
     };
 
-    // Create main integrated server
-    const integratedServer = createServer(async (req, res) => {
-      const url = new URL(req.url || '/', `http://${req.headers.host}`);
+    // Main integrated HTTP server
+    const integratedServer = createServer(async (req: any, res: any) => {
+      const url = new URL(req.url || "/", `http://${req.headers.host}`);
       const pathname = url.pathname;
 
       elizaLogger.debug(`Request: ${req.method} ${pathname}`);
 
-      // Handle auth and agents requests with AuthServer middleware
-      if (pathname.startsWith('/auth/') || pathname.startsWith('/agents/')) {
+      // 1) Handle auth and agents via middleware (kept from HEAD)
+      if (pathname.startsWith("/auth/") || pathname.startsWith("/agents/")) {
         elizaLogger.debug(`Routing to middleware: ${pathname}`);
         const authMiddleware = authServer.createMiddleware();
         await authMiddleware(req, res);
-      } else {
-        elizaLogger.debug(`Proxying to DirectClient: ${pathname}`);
-        // Proxy all other requests to DirectClient
-        proxyRequest(req, res);
+        return;
       }
+
+      // 2) NEW: Let AuthServer handle discovery endpoints
+      if (await authServer.handleDiscovery(req, res)) {
+        return; // handled
+      }
+
+      // 3) Fallback: proxy everything else to DirectClient
+      elizaLogger.debug(`Proxying to DirectClient: ${pathname}`);
+      proxyRequest(req, res);
     });
-    
+
     integratedServer.listen(serverPort, () => {
       elizaLogger.info(`Integrated server started on port ${serverPort}`);
       elizaLogger.info("Available endpoints:");
-      elizaLogger.info(`  Message API: http://localhost:${serverPort}/{agentId}/message`);
+      elizaLogger.info(
+        `  Message API: http://localhost:${serverPort}/{agentId}/message`
+      );
       elizaLogger.info(`  POST http://localhost:${serverPort}/auth/register`);
       elizaLogger.info(`  POST http://localhost:${serverPort}/auth/login`);
       elizaLogger.info(`  POST http://localhost:${serverPort}/auth/verify`);
       elizaLogger.info(`  GET/PUT http://localhost:${serverPort}/agents/by-name`);
+      // ✅ Updated discovery endpoint:
+      elizaLogger.info(
+        `  GET  http://localhost:${serverPort}/discovery/comprehensive-record?userId=...&roomId=...`
+      );
     });
   }
 
@@ -244,7 +248,7 @@ const startAgents = async () => {
   }
 
   const isDaemonProcess = process.env.DAEMON_PROCESS === "true";
-  if(!isDaemonProcess) {
+  if (!isDaemonProcess) {
     elizaLogger.log("Chat started. Type 'exit' to quit.");
     const chat = startChat(characters);
     chat();
